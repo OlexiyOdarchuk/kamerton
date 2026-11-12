@@ -56,6 +56,8 @@ pub struct Failure {
     pub message: String,
     /// Оригінальний текст помилки yt-dlp (для підказки).
     pub details: String,
+    /// Останні рядки виводу yt-dlp (для звіту про помилку).
+    pub log: String,
     pub kind: FailureKind,
 }
 
@@ -70,7 +72,8 @@ pub enum FailureKind {
 
 impl Failure {
     pub fn other(message: impl Into<String>, details: impl Into<String>) -> Self {
-        Self { message: message.into(), details: details.into(), kind: FailureKind::Other }
+        let details = details.into();
+        Self { message: message.into(), log: details.clone(), details, kind: FailureKind::Other }
     }
 }
 
@@ -101,6 +104,8 @@ pub struct Job {
     pub note: Option<String>,
     pub cancel: Arc<AtomicBool>,
     pub pid: Option<u32>,
+    /// Коли натиснули «Скопіювати звіт» (щоб коротко показати «Скопійовано»).
+    pub copied_at: Option<f64>,
 }
 
 pub type JobRef = Arc<Mutex<Job>>;
@@ -123,6 +128,7 @@ impl Job {
             note: None,
             cancel: Arc::new(AtomicBool::new(false)),
             pid: None,
+            copied_at: None,
         }))
     }
 
@@ -211,9 +217,17 @@ fn explain(stderr: &str) -> Failure {
         .unwrap_or("Невідома помилка")
         .trim()
         .to_string();
+    // Останні рядки виводу yt-dlp для звіту про помилку.
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let log = lines[lines.len().saturating_sub(40)..].join("\n");
     let e = stderr.to_lowercase();
     let has = |s: &str| e.contains(s);
-    let login = |m: &str| Failure { message: m.into(), details: first_error.clone(), kind: FailureKind::NeedsLogin };
+    let login = |m: &str| Failure {
+        message: m.into(),
+        details: first_error.clone(),
+        log: log.clone(),
+        kind: FailureKind::NeedsLogin,
+    };
     // Chrome/Edge на Windows шифрують вхід (yt-dlp issue 10927): «Failed to decrypt with DPAPI».
     if has("dpapi")
         || has("app-bound")
@@ -224,6 +238,7 @@ fn explain(stderr: &str) -> Failure {
         return Failure {
             message: "Не вдалося взяти вхід з браузера.".into(),
             details: first_error,
+            log,
             kind: FailureKind::CookiesUnreadable,
         };
     }
@@ -260,7 +275,7 @@ fn explain(stderr: &str) -> Failure {
     } else {
         "Не вдалося скачати."
     };
-    Failure::other(message, first_error)
+    Failure { message: message.into(), details: first_error, log, kind: FailureKind::Other }
 }
 
 fn codec_name(acodec: &str) -> String {

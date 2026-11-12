@@ -4,6 +4,7 @@
 mod app;
 mod components;
 mod install;
+mod instance;
 mod job;
 mod settings;
 mod theme;
@@ -14,10 +15,36 @@ mod widgets;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    let uninstall = std::env::args().any(|a| a == "--uninstall");
     // Windows: перший запуск зі «Завантажень» встановлює програму і відкриває встановлену копію.
-    if install::ensure_installed() {
+    if !uninstall && install::ensure_installed() {
         return Ok(());
     }
+
+    let dirs = util::AppDirs::new();
+    let instance = match instance::acquire(&dirs.data) {
+        instance::Acquire::First(i) => i,
+        // Вже відкрито: та копія сама вийде на передній план і додасть посилання.
+        instance::Acquire::Second => {
+            if uninstall {
+                rfd::MessageDialog::new()
+                    .set_title("Камертон")
+                    .set_description("Спершу закрийте Камертон, а потім спробуйте видалити ще раз.")
+                    .show();
+            }
+            return Ok(());
+        }
+    };
+
+    // Видалення з «Програм та можливостей» Windows.
+    if uninstall {
+        if install::confirm_uninstall() {
+            drop(instance);
+            install::uninstall(&dirs.root());
+        }
+        return Ok(());
+    }
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Камертон")
         .with_app_id("kamerton")
@@ -27,5 +54,9 @@ fn main() -> eframe::Result {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("Камертон", options, Box::new(|cc| Ok(Box::new(app::KamertonApp::new(cc)))))
+    eframe::run_native(
+        "Камертон",
+        options,
+        Box::new(move |cc| Ok(Box::new(app::KamertonApp::new(cc, dirs, instance)))),
+    )
 }

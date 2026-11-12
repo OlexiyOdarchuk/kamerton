@@ -25,6 +25,14 @@ impl AppDirs {
         Self { data, config }
     }
 
+    /// Спільна тека налаштувань і даних програми (на Windows `%APPDATA%\Kamerton`).
+    pub fn root(&self) -> PathBuf {
+        match (self.data.parent(), self.config.parent()) {
+            (Some(a), Some(b)) if a == b => a.to_path_buf(),
+            _ => self.data.clone(),
+        }
+    }
+
     pub fn bin(&self) -> PathBuf {
         self.data.join("bin")
     }

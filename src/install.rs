@@ -47,7 +47,11 @@ pub fn ensure_installed() -> bool {
     false
 }
 
-/// Ярлики «Камертон» на робочому столі і в меню «Пуск».
+/// Ключ реєстру, через який програма видна в «Програмах та можливостях».
+#[cfg(windows)]
+const UNINSTALL_KEY: &str = r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kamerton";
+
+/// Ярлики «Камертон» на робочому столі і в меню «Пуск» та запис у «Програмах та можливостях».
 #[cfg(windows)]
 fn create_shortcuts(target: &std::path::Path) {
     let target = target.display().to_string().replace('\'', "''");
@@ -60,13 +64,80 @@ fn create_shortcuts(target: &std::path::Path) {
            $l.WorkingDirectory = '{dir}'\n\
            $l.Description = 'Завантаження відео і музики'\n\
            $l.Save()\n\
-         }}"
+         }}\n\
+         $k = '{UNINSTALL_KEY}'\n\
+         New-Item -Path $k -Force | Out-Null\n\
+         Set-ItemProperty -Path $k -Name DisplayName -Value 'Камертон'\n\
+         Set-ItemProperty -Path $k -Name DisplayIcon -Value '{target}'\n\
+         Set-ItemProperty -Path $k -Name InstallLocation -Value '{dir}'\n\
+         Set-ItemProperty -Path $k -Name UninstallString -Value '\"{target}\" --uninstall'\n\
+         Set-ItemProperty -Path $k -Name NoModify -Value 1 -Type DWord\n\
+         Set-ItemProperty -Path $k -Name NoRepair -Value 1 -Type DWord"
     );
-    // -EncodedCommand (UTF-16LE у base64), щоб кирилиця не побилась через кодування консолі.
+    let _ = powershell(&script).status();
+}
+
+/// PowerShell без вікна. Скрипт передається як -EncodedCommand (UTF-16LE у base64),
+/// щоб кирилиця не побилась через кодування консолі.
+#[cfg(windows)]
+fn powershell(script: &str) -> std::process::Command {
     let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let _ = crate::util::command("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &base64(&utf16)])
-        .status();
+    let mut cmd = crate::util::command("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &base64(&utf16)]);
+    cmd
+}
+
+/// Чи це встановлена копія (видалення має сенс лише для неї).
+#[cfg(windows)]
+pub fn is_installed_copy() -> bool {
+    let (Ok(exe), Some(local)) = (std::env::current_exe(), std::env::var_os("LOCALAPPDATA")) else {
+        return false;
+    };
+    let target = std::path::PathBuf::from(local).join("Programs").join("Kamerton").join("kamerton.exe");
+    exe.to_string_lossy().eq_ignore_ascii_case(&target.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+pub fn is_installed_copy() -> bool {
+    false
+}
+
+/// Видаляє програму: ярлики, запис у реєстрі, теку програми і завантажені інструменти,
+/// налаштування та історію. Скачані відео й музика лишаються.
+/// Працює у фоновому PowerShell, який чекає, поки ця копія закриється.
+#[cfg(windows)]
+pub fn uninstall(app_data: &std::path::Path) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let q = |p: &std::path::Path| p.display().to_string().replace('\'', "''");
+    let install_dir = exe.parent().map(q).unwrap_or_default();
+    let data = q(app_data);
+    let script = format!(
+        "Start-Sleep -Seconds 2\n\
+         foreach ($d in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) {{\n\
+           Remove-Item -LiteralPath (Join-Path $d 'Камертон.lnk') -Force -ErrorAction SilentlyContinue\n\
+         }}\n\
+         Remove-Item -Path '{UNINSTALL_KEY}' -Recurse -Force -ErrorAction SilentlyContinue\n\
+         Remove-Item -LiteralPath '{data}' -Recurse -Force -ErrorAction SilentlyContinue\n\
+         Remove-Item -LiteralPath '{install_dir}' -Recurse -Force -ErrorAction SilentlyContinue"
+    );
+    let _ = powershell(&script).spawn();
+}
+
+#[cfg(not(windows))]
+pub fn uninstall(_: &std::path::Path) {}
+
+/// Запит підтвердження у звичайному вікні Windows.
+pub fn confirm_uninstall() -> bool {
+    rfd::MessageDialog::new()
+        .set_title("Видалити Камертон")
+        .set_description(
+            "Буде видалено програму, ярлики, завантажені інструменти, налаштування та історію.\n\
+             Скачані відео й музика залишаться на місці.",
+        )
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .set_level(rfd::MessageLevel::Warning)
+        .show()
+        == rfd::MessageDialogResult::Yes
 }
 
 #[cfg(any(windows, test))]

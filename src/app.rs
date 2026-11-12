@@ -9,6 +9,8 @@ use crate::components::{self, State, Tools};
 use crate::job::{self, FailureKind, Job, JobRef, Status};
 use crate::settings::{self, AudioFormat, HistoryEntry, Mode, Settings, ThemeChoice};
 use crate::theme::{self, Palette, icon};
+use crate::install;
+use crate::instance::Instance;
 use crate::util::{self, AppDirs};
 use crate::updater::{self, UpdateState};
 use crate::widgets;
@@ -36,6 +38,17 @@ pub struct KamertonApp {
     history: Vec<HistoryEntry>,
     done_tx: Sender<HistoryEntry>,
     done_rx: Receiver<HistoryEntry>,
+    /// Блокування «лише одна копія»; посилання від інших копій приходять у `inbox_rx`.
+    instance: Instance,
+    inbox_rx: Receiver<String>,
+    /// Чи було вікно у фокусі минулого кадру (щоб помітити повернення до вікна).
+    was_focused: bool,
+    /// Текст буфера обміну, який уже бачили, щоб не пропонувати те саме двічі.
+    clipboard_seen: String,
+    /// Посилання з буфера, які пропонуємо додати.
+    clipboard_offer: Vec<String>,
+    /// Скільки завантажень завершилось, поки вікно було не у фокусі.
+    unseen_done: usize,
     #[cfg(debug_assertions)]
     debug_shot_done: bool,
 }
@@ -51,13 +64,14 @@ fn is_audio(path: &std::path::Path) -> bool {
 }
 
 impl KamertonApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, dirs: AppDirs, instance: Instance) -> Self {
         let ctx = &cc.egui_ctx;
         egui_extras::install_image_loaders(ctx);
         theme::install(ctx);
 
-        let dirs = AppDirs::new();
-        // Залишки недокачаного з попереднього запуску.
+        let (inbox_tx, inbox_rx) = channel();
+        instance.watch(inbox_tx, ctx.clone());
+        // Залишки недокачаного з попереднього запуску (інша копія не працює, це гарантує блокування).
         let _ = std::fs::remove_dir_all(dirs.tmp());
         let tools = Tools::new(dirs.bin());
         let settings = Settings::load(&dirs.config.join("settings.json"));
@@ -85,11 +99,17 @@ impl KamertonApp {
             history,
             done_tx,
             done_rx,
+            instance,
+            inbox_rx,
+            was_focused: false,
+            clipboard_seen: String::new(),
+            clipboard_offer: Vec::new(),
+            unseen_done: 0,
             #[cfg(debug_assertions)]
             debug_shot_done: false,
         };
         // Посилання, передані при запуску (наприклад, «Відкрити за допомогою…»).
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).collect();
         app.add_urls(&args.join(" "));
         app
     }
@@ -111,6 +131,95 @@ impl KamertonApp {
     fn paste_clipboard(&mut self) {
         if let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             self.add_urls(&text);
+            self.clipboard_seen = text;
+            self.clipboard_offer.clear();
+        }
+    }
+
+    /// Версія програми, система і версії інструментів: перші рядки звіту про помилку.
+    fn env_info(&self) -> String {
+        let components = match &*self.components.lock().unwrap() {
+            State::Ready(s) => s.clone(),
+            State::Working(s, _) => format!("ще настроюється: {s}"),
+            State::Failed(s) => format!("не встановлено: {s}"),
+        };
+        format!(
+            "Камертон {} ({} {})\nІнструменти: {components}\nВхід через браузер: {}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            if self.settings.cookies_browser.is_empty() { "ні" } else { &self.settings.cookies_browser },
+        )
+    }
+
+    /// Якщо в буфері обміну нове посилання, пропонуємо його додати.
+    fn check_clipboard(&mut self) {
+        let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) else { return };
+        if text == self.clipboard_seen {
+            return;
+        }
+        self.clipboard_seen = text.clone();
+        // Лише явні посилання з http(s), щоб не чіплятись до будь-якого тексту.
+        let known: Vec<String> = self.jobs.iter().map(|j| j.lock().unwrap().url.clone()).collect();
+        self.clipboard_offer = util::extract_urls(&text)
+            .into_iter()
+            .filter(|u| text.contains(u.as_str()) && !known.contains(u))
+            .collect();
+    }
+
+    fn clipboard_bar(&mut self, ui: &mut egui::Ui) {
+        if self.clipboard_offer.is_empty() {
+            return;
+        }
+        let p = theme::palette(ui.ctx());
+        ui.add_space(8.0);
+        egui::Frame::new()
+            .fill(p.card)
+            .stroke(Stroke::new(2.0, p.accent_line))
+            .corner_radius(theme::RADIUS)
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let n = self.clipboard_offer.len();
+                    let text = if n == 1 {
+                        "У буфері обміну є посилання:".to_string()
+                    } else {
+                        format!("У буфері обміну є посилання ({n}):")
+                    };
+                    ui.label(RichText::new(text).font(FontId::new(16.0, theme::bold())));
+                    let mut add = false;
+                    let mut dismiss = false;
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Не треба").clicked() {
+                            dismiss = true;
+                        }
+                        if widgets::primary(ui, icon::PLUS, "Додати", true).clicked() {
+                            add = true;
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Label::new(RichText::new(&self.clipboard_offer[0]).color(p.dim)).truncate());
+                        });
+                    });
+                    if add {
+                        let urls = std::mem::take(&mut self.clipboard_offer).join(" ");
+                        self.add_urls(&urls);
+                    } else if dismiss {
+                        self.clipboard_offer.clear();
+                    }
+                });
+            });
+    }
+
+    /// Видалення встановленої копії (лише Windows).
+    fn uninstall_now(&mut self, ctx: &egui::Context) {
+        if install::confirm_uninstall() {
+            for j in &self.jobs {
+                j.lock().unwrap().stop();
+            }
+            self.instance.release();
+            install::uninstall(&self.dirs.root());
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -214,6 +323,7 @@ impl KamertonApp {
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui.ctx());
+        let mut uninstall = false;
         let extra_open = &mut self.extra_open;
         let browsers = &self.browsers;
         let s = &mut self.settings;
@@ -389,9 +499,21 @@ impl KamertonApp {
                 widgets::caption(ui, "Одночасних завантажень");
                 let opts: Vec<_> = (1..=5usize).map(|n| (n, n.to_string(), None)).collect();
                 widgets::plates(ui, &mut s.parallel, &opts);
+                if install::is_installed_copy() {
+                    ui.add_space(10.0);
+                    if widgets::button(ui, icon::TRASH, "Видалити програму…")
+                        .on_hover_text("Скачані відео й музика залишаться на місці")
+                        .clicked()
+                    {
+                        uninstall = true;
+                    }
+                }
             }
             ui.add_space(12.0);
         });
+        if uninstall {
+            self.uninstall_now(ui.ctx());
+        }
     }
 
     /// Підсумок налаштувань унизу панелі: що саме буде скачано.
@@ -446,6 +568,9 @@ impl KamertonApp {
                     *self.components.lock().unwrap() = State::Working("Перевірка компонентів…".into(), None);
                     components::spawn_update(self.tools.clone(), self.components.clone(), ui.ctx().clone());
                 }
+                if widgets::button(ui, icon::COPY, "Скопіювати звіт").clicked() {
+                    ui.ctx().copy_text(self.env_info());
+                }
             }
         }
     }
@@ -489,6 +614,8 @@ impl KamertonApp {
                         if busy {
                             resp.on_hover_text("Дочекайтесь, поки завершаться завантаження");
                         } else if resp.clicked() {
+                            // Нова копія має отримати блокування «одна копія», тому звільняємо його.
+                            self.instance.release();
                             updater::restart(ui.ctx());
                         }
                     });
@@ -556,10 +683,11 @@ impl KamertonApp {
         let mut use_browser = None;
         let browsers = &self.browsers;
         let current = self.settings.cookies_browser.as_str();
+        let env_info = self.env_info();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for job in &self.jobs {
                 let mut j = job.lock().unwrap();
-                match job_card(ui, &p, &mut j, ready, browsers, current) {
+                match job_card(ui, &p, &mut j, ready, browsers, current, &env_info) {
                     CardAction::Remove => remove.push(j.id),
                     CardAction::UseBrowser(key) => use_browser = Some(key),
                     CardAction::None => {}
@@ -685,6 +813,7 @@ fn job_card(
     components_ready: bool,
     browsers: &[(&'static str, &'static str)],
     current_browser: &str,
+    env_info: &str,
 ) -> CardAction {
     let mut remove = false;
     let mut chosen = None;
@@ -720,7 +849,7 @@ fn job_card(
                         j.status = if j.info.is_some() { Status::Queued } else { Status::NeedInfo };
                     }
                 }
-                card_buttons(ui, j, components_ready);
+                card_buttons(ui, j, components_ready, env_info);
             });
         });
     });
@@ -948,9 +1077,34 @@ fn status_block(ui: &mut egui::Ui, p: &Palette, j: &Job) {
     }
 }
 
-fn card_buttons(ui: &mut egui::Ui, j: &mut Job, components_ready: bool) {
+/// Текст для того, хто допомагає віддалено: що, де і як саме не вдалося.
+fn failure_report(j: &Job, f: &job::Failure, env_info: &str) -> String {
+    let summary = if j.summary.is_empty() { "інформація про відео" } else { j.summary.as_str() };
+    format!(
+        "{env_info}\nПосилання: {}\nЩо качалось: {summary}\nПомилка: {}\n\n--- yt-dlp ---\n{}",
+        j.url, f.message, f.log
+    )
+}
+
+fn card_buttons(ui: &mut egui::Ui, j: &mut Job, components_ready: bool, env_info: &str) {
     // Переносимо кнопки на новий рядок, якщо вікно вузьке, замість того щоб вилазити за картку.
     ui.horizontal_wrapped(|ui| {
+        if let Status::Failed(f) | Status::InfoFailed(f) = &j.status {
+            let report = failure_report(j, f, env_info);
+            if widgets::button(ui, icon::COPY, "Скопіювати звіт")
+                .on_hover_text("Скопіювати опис помилки, щоб надіслати тому, хто допомагає")
+                .clicked()
+            {
+                ui.ctx().copy_text(report);
+                j.copied_at = Some(ui.input(|i| i.time));
+            }
+            if let Some(t) = j.copied_at
+                && ui.input(|i| i.time) - t < 4.0
+            {
+                widgets::dim(ui, &theme::palette(ui.ctx()), "Скопійовано, вставте в повідомлення");
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            }
+        }
         match &j.status {
             Status::Ready => {
                 if widgets::accent_outline(ui, icon::DOWNLOAD, "Завантажити", j.trim_range().is_ok()).clicked() {
@@ -999,6 +1153,49 @@ fn card_buttons(ui: &mut egui::Ui, j: &mut Job, components_ready: bool) {
 }
 
 impl eframe::App for KamertonApp {
+    /// Те, що має працювати й тоді, коли вікно згорнуте (eframe тоді не викликає `ui`):
+    /// черга завантажень, історія, посилання від інших копій, сигнал «Готово».
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+
+        while let Ok(entry) = self.done_rx.try_recv() {
+            self.history.insert(0, entry);
+            self.history.truncate(500);
+            settings::save_history(&self.dirs.config.join("history.json"), &self.history);
+            if !focused {
+                // Вікно згорнуте або позаду: блимаємо іконкою на панелі задач і пишемо в заголовку.
+                self.unseen_done += 1;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("Готово ({}) · Камертон", self.unseen_done)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Informational,
+                ));
+            }
+        }
+        if focused && self.unseen_done > 0 {
+            self.unseen_done = 0;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title("Камертон".into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Reset));
+        }
+
+        // Хтось запустив програму вдруге: показуємо це вікно і додаємо передані посилання.
+        let mut show = false;
+        while let Ok(line) = self.inbox_rx.try_recv() {
+            self.add_urls(&line);
+            show = true;
+        }
+        if show {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
+        self.schedule(ctx);
+        if self.settings != self.saved_settings {
+            self.settings.save(&self.dirs.config.join("settings.json"));
+            self.saved_settings = self.settings.clone();
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let wanted = match self.settings.theme {
@@ -1011,22 +1208,21 @@ impl eframe::App for KamertonApp {
         }
         let p = theme::palette(&ctx);
 
-        while let Ok(entry) = self.done_rx.try_recv() {
-            self.history.insert(0, entry);
-            self.history.truncate(500);
-            settings::save_history(&self.dirs.config.join("history.json"), &self.history);
-        }
         self.handle_input(&ctx);
-        self.schedule(&ctx);
-        if self.settings != self.saved_settings {
-            self.settings.save(&self.dirs.config.join("settings.json"));
-            self.saved_settings = self.settings.clone();
+        // Повернулась до вікна: можливо, в буфері нове посилання.
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if focused && !self.was_focused {
+            self.check_clipboard();
         }
+        self.was_focused = focused;
 
         let bar = |fill| egui::Frame::new().fill(fill).inner_margin(Margin::symmetric(16, 10));
         egui::Panel::top("top")
             .frame(bar(p.panel).stroke(Stroke::new(1.0, p.border)))
-            .show(ui, |ui| self.top_bar(ui));
+            .show(ui, |ui| {
+                self.top_bar(ui);
+                self.clipboard_bar(ui);
+            });
         egui::Panel::bottom("status")
             .frame(bar(p.panel).inner_margin(Margin::symmetric(16, 6)))
             .show(ui, |ui| self.status_bar(ui));
