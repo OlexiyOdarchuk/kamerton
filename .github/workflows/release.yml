@@ -1,0 +1,69 @@
+# Реліз: підняти version у Cargo.toml, закомітити, потім
+#   git tag v0.2.0 && git push origin v0.2.0
+# CI збере програму під Windows, Linux і macOS і прикладе файли до релізу.
+# Встановлені копії підхоплять оновлення при наступному запуску.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Перевірити, що тег збігається з версією
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "Версія в Cargo.toml ($v) не збігається з тегом $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+      - name: Створити реліз
+        run: gh release create "$GITHUB_REF_NAME" --title "Камертон $GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: create
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: kamerton.exe
+            asset: kamerton-windows-x86_64.exe
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bin: kamerton
+            asset: kamerton-linux-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bin: kamerton
+            asset: kamerton-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        shell: bash
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Бібліотеки для Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev
+      - name: Збірка
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Додати до релізу
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+          gh release upload "$GITHUB_REF_NAME" "${{ matrix.asset }}" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

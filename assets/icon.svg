@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Фон: сині чорнила -->
+  <rect x="8" y="8" width="240" height="240" rx="44" fill="#233F8C"/>
+  <!-- Звукові хвилі від камертона -->
+  <g fill="none" stroke="#FFFDF8" stroke-width="10" stroke-linecap="round" opacity="0.55">
+    <path d="M 58 58 Q 44 86 58 114"/>
+    <path d="M 198 58 Q 212 86 198 114"/>
+  </g>
+  <!-- Камертон: дві ніжки -->
+  <path d="M 96 40 V 112 A 32 32 0 0 0 160 112 V 40" fill="none" stroke="#FFFDF8" stroke-width="24" stroke-linecap="round"/>
+  <!-- Ніжка-стрілка вниз -->
+  <rect x="117" y="140" width="22" height="46" fill="#FFFDF8"/>
+  <polygon points="92,180 164,180 128,222" fill="#FFFDF8" stroke="#FFFDF8" stroke-width="6" stroke-linejoin="round"/>
+</svg>
