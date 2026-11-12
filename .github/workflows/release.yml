@@ -3,7 +3,8 @@
 # Повідомлення тегу стане описом релізу. CI збере програму під Windows, Linux і macOS
 # і прикладе файли до релізу. Встановлені копії підхоплять оновлення при наступному запуску.
 #
-# Щоб доскласти файли до вже існуючого релізу: Actions → Release → Run workflow → тег.
+# Щоб доскласти файл до вже існуючого релізу: Actions → Release → Run workflow → тег і платформа.
+#   gh workflow run release.yml -f tag=v0.1.0 -f platform=macos
 name: Release
 
 on:
@@ -14,6 +15,11 @@ on:
       tag:
         description: "Тег існуючого релізу, наприклад v0.1.0"
         required: true
+      platform:
+        description: "Що зібрати"
+        type: choice
+        options: [all, windows, linux, macos]
+        default: all
 
 permissions:
   contents: write
@@ -24,7 +30,20 @@ env:
 jobs:
   create:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
+      - name: Які платформи збирати
+        id: matrix
+        run: |
+          all='[
+            {"name": "windows", "os": "windows-latest", "target": "x86_64-pc-windows-msvc", "bin": "kamerton.exe", "asset": "kamerton-windows-x86_64.exe"},
+            {"name": "linux", "os": "ubuntu-22.04", "target": "x86_64-unknown-linux-gnu", "bin": "kamerton", "asset": "kamerton-linux-x86_64"},
+            {"name": "macos", "os": "macos-latest", "target": "aarch64-apple-darwin", "bin": "kamerton", "asset": "kamerton-macos-aarch64"}
+          ]'
+          echo "matrix=$(echo "$all" | jq -c --arg p "$PLATFORM" 'map(select($p == "all" or .name == $p))')" >> "$GITHUB_OUTPUT"
+        env:
+          PLATFORM: ${{ github.event.inputs.platform || 'all' }}
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG }}
@@ -55,19 +74,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin: kamerton.exe
-            asset: kamerton-windows-x86_64.exe
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            bin: kamerton
-            asset: kamerton-linux-x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            bin: kamerton
-            asset: kamerton-macos-aarch64
+        include: ${{ fromJSON(needs.create.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
