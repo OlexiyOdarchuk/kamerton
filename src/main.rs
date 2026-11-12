@@ -48,6 +48,8 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    install::register_desktop_entry();
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Камертон")
         .with_app_id("kamerton")

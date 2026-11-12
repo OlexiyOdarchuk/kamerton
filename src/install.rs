@@ -4,6 +4,8 @@
 //! вона копіює себе в `%LOCALAPPDATA%\Programs\Kamerton`, створює ярлики на робочому столі
 //! і в меню «Пуск» і перезапускається звідти. Права адміністратора не потрібні,
 //! а автооновлення потім має право замінювати файл.
+//!
+//! На Linux програма лише додає себе в меню програм (див. [`register_desktop_entry`]).
 
 /// Повертає `true`, якщо запущено встановлену копію і цей процес треба завершити.
 #[cfg(windows)]
@@ -45,6 +47,70 @@ pub fn ensure_installed() -> bool {
 #[cfg(not(windows))]
 pub fn ensure_installed() -> bool {
     false
+}
+
+/// Linux: пункт «Камертон» у меню програм (`~/.local/share/applications`) і значок у темі
+/// `hicolor`. `Exec` вказує на поточний файл програми, тож запис працює і для `cargo install`,
+/// і для завантаженого файлу. Якщо файл програми видалити, `TryExec` ховає пункт з меню.
+#[cfg(target_os = "linux")]
+pub fn register_desktop_entry() {
+    if cfg!(debug_assertions) || std::env::var_os("KAMERTON_NO_INSTALL").is_some() {
+        return;
+    }
+    let (Some(exe), Some(base)) = (crate::updater::exe_path(), directories::BaseDirs::new()) else {
+        return;
+    };
+    let share = base.data_dir();
+    let icons = share.join("icons").join("hicolor");
+    write_if_changed(&icons.join("scalable/apps/kamerton.svg"), include_bytes!("../assets/icon.svg"));
+    write_if_changed(&icons.join("256x256/apps/kamerton.png"), include_bytes!("../assets/icon.png"));
+    write_if_changed(&share.join("applications/kamerton.desktop"), desktop_entry(&exe).as_bytes());
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn register_desktop_entry() {}
+
+#[cfg(any(target_os = "linux", test))]
+fn desktop_entry(exe: &std::path::Path) -> String {
+    let exe = exe.to_string_lossy();
+    // Рядок у .desktop: `\` подвоюється. В Exec ще й лапки з екрануванням `"` `` ` `` `$` `\`, а `%` подвоюється.
+    let string = |s: &str| s.replace('\\', "\\\\");
+    let mut quoted = String::new();
+    for c in exe.chars() {
+        match c {
+            '"' | '`' | '$' | '\\' => quoted.extend(['\\', c]),
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(c),
+        }
+    }
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Камертон\n\
+         GenericName=Завантаження відео і музики\n\
+         Comment=Завантаження відео і музики з YouTube, Facebook, Instagram, TikTok, SoundCloud та інших сайтів\n\
+         TryExec={}\n\
+         Exec=\"{}\" %U\n\
+         Icon=kamerton\n\
+         Terminal=false\n\
+         StartupNotify=true\n\
+         StartupWMClass=kamerton\n\
+         Categories=AudioVideo;\n\
+         Keywords=youtube;video;audio;music;download;відео;музика;завантаження;\n",
+        string(&exe),
+        string(&quoted),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn write_if_changed(path: &std::path::Path, data: &[u8]) {
+    if std::fs::read(path).is_ok_and(|old| old == data) {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, data);
 }
 
 /// Ключ реєстру, через який програма видна в «Програмах та можливостях».
@@ -166,5 +232,14 @@ mod tests {
         assert_eq!(super::base64(&utf16), "GgQwBDwENQRABEIEPgQ9BCAAbwBrAA==");
         assert_eq!(super::base64(b"ab"), "YWI=");
         assert_eq!(super::base64(b"abc"), "YWJj");
+    }
+
+    #[test]
+    fn desktop_entry_quotes_exec() {
+        let e = super::desktop_entry(std::path::Path::new("/home/u/my apps/100%/kamerton"));
+        assert!(e.contains("\nExec=\"/home/u/my apps/100%%/kamerton\" %U\n"));
+        assert!(e.contains("\nTryExec=/home/u/my apps/100%/kamerton\n"));
+        let e = super::desktop_entry(std::path::Path::new("/a\\b/$x"));
+        assert!(e.contains("\nExec=\"/a\\\\\\\\b/\\\\$x\" %U\n"));
     }
 }
