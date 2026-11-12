@@ -149,3 +149,25 @@ mod tests {
         assert_eq!(v["auto"], true);
     }
 }
+
+/// Живий тест: надсилає один звіт через справжній воркер.
+/// `KAMERTON_REPORT_URL=https://… cargo test report_live -- --ignored`
+#[cfg(test)]
+mod live {
+    #[test]
+    #[ignore]
+    fn report_live() {
+        assert!(super::available(), "збірка без KAMERTON_REPORT_URL");
+        let r = super::Report::new(
+            "тест".into(),
+            "https://example.com/тест".into(),
+            "тест".into(),
+            "Тестовий звіт, перевірка зв'язку".into(),
+            "ERROR: це лише тест".into(),
+            false,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        super::send(r, move |ok| tx.send(ok).unwrap());
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap(), "воркер не прийняв звіт");
+    }
+}
