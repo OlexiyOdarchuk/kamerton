@@ -13,7 +13,7 @@ pub fn ensure_installed() -> bool {
     if cfg!(debug_assertions) || std::env::var_os("KAMERTON_NO_INSTALL").is_some() {
         return false;
     }
-    let (Ok(exe), Some(local)) = (std::env::current_exe(), std::env::var_os("LOCALAPPDATA")) else {
+    let (Ok(exe), Some(local)) = (crate::updater::exe_path().ok_or(()), std::env::var_os("LOCALAPPDATA")) else {
         return false;
     };
     let dir = PathBuf::from(local).join("Programs").join("Kamerton");
@@ -90,7 +90,7 @@ fn powershell(script: &str) -> std::process::Command {
 /// Чи це встановлена копія (видалення має сенс лише для неї).
 #[cfg(windows)]
 pub fn is_installed_copy() -> bool {
-    let (Ok(exe), Some(local)) = (std::env::current_exe(), std::env::var_os("LOCALAPPDATA")) else {
+    let (Ok(exe), Some(local)) = (crate::updater::exe_path().ok_or(()), std::env::var_os("LOCALAPPDATA")) else {
         return false;
     };
     let target = std::path::PathBuf::from(local).join("Programs").join("Kamerton").join("kamerton.exe");
@@ -107,7 +107,7 @@ pub fn is_installed_copy() -> bool {
 /// Працює у фоновому PowerShell, який чекає, поки ця копія закриється.
 #[cfg(windows)]
 pub fn uninstall(app_data: &std::path::Path) {
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = crate::updater::exe_path().ok_or(()) else { return };
     let q = |p: &std::path::Path| p.display().to_string().replace('\'', "''");
     let install_dir = exe.parent().map(q).unwrap_or_default();
     let data = q(app_data);

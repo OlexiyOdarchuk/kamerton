@@ -16,6 +16,8 @@ mod widgets;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    // Запам'ятати шлях до програми, поки оновлення ще не перейменувало файл.
+    let _ = updater::exe_path();
     let uninstall = std::env::args().any(|a| a == "--uninstall");
     // Windows: перший запуск зі «Завантажень» встановлює програму і відкриває встановлену копію.
     if !uninstall && install::ensure_installed() {

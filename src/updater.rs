@@ -58,9 +58,19 @@ fn old_path(exe: &Path) -> PathBuf {
     exe.with_extension("old")
 }
 
+static EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Шлях до програми, запам'ятований на старті. Після заміни файлу `current_exe()`
+/// на Linux показує вже перейменований `.old`, і перезапуск відкрив би стару версію.
+pub fn exe_path() -> Option<PathBuf> {
+    EXE.get_or_init(|| std::env::current_exe().ok()).clone()
+}
+
 /// Прибирає файл попередньої версії, що лишився після оновлення.
 pub fn cleanup_old() {
-    if let Ok(exe) = std::env::current_exe() {
+    if let Some(exe) = exe_path()
+        && exe.extension().is_none_or(|e| e != "old")
+    {
         let _ = std::fs::remove_file(old_path(&exe));
     }
 }
@@ -90,7 +100,11 @@ fn check_and_install(state: &Arc<Mutex<UpdateState>>, ctx: &egui::Context) -> Re
         return Ok(());
     }
 
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = exe_path().ok_or("не вдалося визначити шлях до програми")?;
+    if exe.extension().is_some_and(|e| e == "old" || e == "new") {
+        // Запущено тимчасовий файл попередньої версії: нічого не підміняємо.
+        return Ok(());
+    }
     let new = exe.with_extension("new");
     let url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset}");
     let label = format!("Завантаження нової версії {tag}");
@@ -132,7 +146,7 @@ fn check_and_install(state: &Arc<Mutex<UpdateState>>, ctx: &egui::Context) -> Re
 
 /// Запускає нову версію і закриває поточну.
 pub fn restart(ctx: &egui::Context) {
-    if let Ok(exe) = std::env::current_exe()
+    if let Some(exe) = exe_path()
         && std::process::Command::new(exe).spawn().is_ok()
     {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
