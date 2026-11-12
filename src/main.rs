@@ -6,6 +6,7 @@ mod components;
 mod install;
 mod instance;
 mod job;
+mod report;
 mod settings;
 mod theme;
 mod updater;

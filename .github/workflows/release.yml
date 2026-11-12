@@ -91,6 +91,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev
       - name: Збірка
         run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          # Адреса воркера, що пересилає звіти про помилки в Telegram (секрет репозиторію).
+          KAMERTON_REPORT_URL: ${{ secrets.KAMERTON_REPORT_URL }}
       - name: Додати до релізу
         shell: bash
         run: |

@@ -116,6 +116,7 @@ pub mod icon {
     pub const SUN: &str = "\u{e472}";
     pub const MOON: &str = "\u{e330}";
     pub const AUTO_THEME: &str = "\u{e18c}";
+    pub const SEND: &str = "\u{e398}";
 }
 
 pub fn install(ctx: &egui::Context) {

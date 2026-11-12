@@ -104,8 +104,10 @@ pub struct Job {
     pub note: Option<String>,
     pub cancel: Arc<AtomicBool>,
     pub pid: Option<u32>,
-    /// Коли натиснули «Скопіювати звіт» (щоб коротко показати «Скопійовано»).
-    pub copied_at: Option<f64>,
+    /// Стан звіту про помилку цієї картки (змінюється з фонового потоку).
+    pub report: Arc<Mutex<crate::report::ReportState>>,
+    /// Яку помилку вже розглянули для автоматичного звіту (щоб не слати двічі).
+    pub report_key: Option<String>,
 }
 
 pub type JobRef = Arc<Mutex<Job>>;
@@ -128,7 +130,8 @@ impl Job {
             note: None,
             cancel: Arc::new(AtomicBool::new(false)),
             pid: None,
-            copied_at: None,
+            report: Arc::new(Mutex::new(crate::report::ReportState::NotSent)),
+            report_key: None,
         }))
     }
 
@@ -516,6 +519,14 @@ fn ffmpeg_post(tools: &Tools, path: &Path, s: &Settings) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
+/// Помилка, яка зазвичай зникає при повторній спробі (а не «потрібен вхід» чи «відео немає»).
+fn is_transient(stderr: &str) -> bool {
+    let e = stderr.to_lowercase();
+    ["http error 403", "http error 5", "timed out", "connection reset", "remote end closed", "incompleteread"]
+        .iter()
+        .any(|s| e.contains(s))
+}
+
 fn pp_label(name: &str) -> &'static str {
     match name {
         "Merger" => "Склеювання відео і звуку…",
@@ -606,13 +617,9 @@ pub fn spawn_download(
             ctx.request_repaint();
         };
 
-        let mut child = match ytdlp_command(&tools, &args).spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                finish(Status::Failed(Failure::other("Не вдалося запустити yt-dlp.", e.to_string())));
-                return;
-            }
-        };
+        // Один запуск yt-dlp: (успіх, хвіст stderr).
+        let run_once = || -> Result<(bool, String), String> {
+        let mut child = ytdlp_command(&tools, &args).spawn().map_err(|e| e.to_string())?;
         job.lock().unwrap().pid = Some(child.id());
 
         // stderr читаємо окремо, щоб процес не завис на заповненому буфері.
@@ -666,13 +673,40 @@ pub fn spawn_download(
         let exit = child.wait();
         let stderr_text = err_thread.join().unwrap_or_default();
         job.lock().unwrap().pid = None;
+        Ok((exit.map(|s| s.success()).unwrap_or(false), stderr_text))
+        };
+
+        // Сайти (особливо YouTube) інколи разово відмовляють (403, обрив). Тоді пробуємо ще раз сам.
+        let mut attempt = 0;
+        let (ok, stderr_text) = loop {
+            let (ok, stderr_text) = match run_once() {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    finish(Status::Failed(Failure::other("Не вдалося запустити yt-dlp.", e)));
+                    return;
+                }
+            };
+            let nothing_saved = job.lock().unwrap().files.is_empty();
+            if !ok && nothing_saved && attempt == 0 && !cancel.load(Ordering::SeqCst) && is_transient(&stderr_text) {
+                attempt += 1;
+                {
+                    let mut j = job.lock().unwrap();
+                    j.status = Status::Downloading;
+                    j.progress = Progress::default();
+                }
+                ctx.request_repaint();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+            break (ok, stderr_text);
+        };
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
         if cancel.load(Ordering::SeqCst) {
             finish(Status::Cancelled);
             return;
         }
-        let ok = exit.map(|s| s.success()).unwrap_or(false);
         let files = job.lock().unwrap().files.clone();
         if !ok && files.is_empty() {
             finish(Status::Failed(explain(&stderr_text)));

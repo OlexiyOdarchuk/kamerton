@@ -211,6 +211,8 @@ pub struct Settings {
     pub cookies_browser: String,
     pub parallel: usize,
     pub theme: ThemeChoice,
+    /// Автоматично надсилати звіти про помилки розробнику.
+    pub send_reports: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -241,6 +243,7 @@ impl Default for Settings {
             cookies_browser: String::new(),
             parallel: 2,
             theme: ThemeChoice::Auto,
+            send_reports: true,
         }
     }
 }

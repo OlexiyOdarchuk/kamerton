@@ -7,6 +7,7 @@ use eframe::egui::{self, Align, Align2, FontId, Layout, Margin, RichText, Stroke
 
 use crate::components::{self, State, Tools};
 use crate::job::{self, FailureKind, Job, JobRef, Status};
+use crate::report::{self, Report, ReportState};
 use crate::settings::{self, AudioFormat, HistoryEntry, Mode, Settings, ThemeChoice};
 use crate::theme::{self, Palette, icon};
 use crate::install;
@@ -49,6 +50,8 @@ pub struct KamertonApp {
     clipboard_offer: Vec<String>,
     /// Скільки завантажень завершилось, поки вікно було не у фокусі.
     unseen_done: usize,
+    /// Чи вже надіслано звіт про невдале встановлення інструментів.
+    components_reported: bool,
     #[cfg(debug_assertions)]
     debug_shot_done: bool,
 }
@@ -105,6 +108,7 @@ impl KamertonApp {
             clipboard_seen: String::new(),
             clipboard_offer: Vec::new(),
             unseen_done: 0,
+            components_reported: false,
             #[cfg(debug_assertions)]
             debug_shot_done: false,
         };
@@ -137,19 +141,51 @@ impl KamertonApp {
     }
 
     /// Версія програми, система і версії інструментів: перші рядки звіту про помилку.
+    /// Версії інструментів і вхід через браузер: частина звіту про помилку.
     fn env_info(&self) -> String {
         let components = match &*self.components.lock().unwrap() {
             State::Ready(s) => s.clone(),
             State::Working(s, _) => format!("ще настроюється: {s}"),
             State::Failed(s) => format!("не встановлено: {s}"),
         };
-        format!(
-            "Камертон {} ({} {})\nІнструменти: {components}\nВхід через браузер: {}",
-            env!("CARGO_PKG_VERSION"),
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-            if self.settings.cookies_browser.is_empty() { "ні" } else { &self.settings.cookies_browser },
-        )
+        let browser = if self.settings.cookies_browser.is_empty() { "ні" } else { &self.settings.cookies_browser };
+        format!("{components}; вхід через браузер: {browser}")
+    }
+
+    /// Автоматичні звіти: нова помилка на картці або невдале встановлення інструментів.
+    /// «Потрібен вхід» і «відео недоступне» не надсилаються: це не збій програми.
+    fn auto_reports(&mut self, ctx: &egui::Context) {
+        if !self.settings.send_reports || !report::available() {
+            return;
+        }
+        let tools = self.env_info();
+        for job in &self.jobs {
+            let mut j = job.lock().unwrap();
+            let (Status::Failed(f) | Status::InfoFailed(f)) = &j.status else { continue };
+            let key = format!("{}|{}", j.url, f.details);
+            if j.report_key.as_deref() == Some(key.as_str()) {
+                continue;
+            }
+            let f = f.clone();
+            j.report_key = Some(key.clone());
+            *j.report.lock().unwrap() = ReportState::NotSent;
+            let expected = f.kind != FailureKind::Other
+                || f.message.contains("недоступне")
+                || f.message.contains("не підтримується")
+                || f.message.contains("Потрібної якості");
+            if !expected && report::may_auto_send(&key) {
+                send_job_report(job_report(&j, &f, &tools, true), &j.report, ctx);
+            }
+        }
+        if !self.components_reported
+            && let State::Failed(msg) = &*self.components.lock().unwrap()
+        {
+            self.components_reported = true;
+            if report::may_auto_send(msg) {
+                let r = Report::new(tools.clone(), String::new(), "встановлення інструментів".into(), msg.clone(), String::new(), true);
+                report::send(r, |_| {});
+            }
+        }
     }
 
     /// Якщо в буфері обміну нове посилання, пропонуємо його додати.
@@ -499,6 +535,16 @@ impl KamertonApp {
                 widgets::caption(ui, "Одночасних завантажень");
                 let opts: Vec<_> = (1..=5usize).map(|n| (n, n.to_string(), None)).collect();
                 widgets::plates(ui, &mut s.parallel, &opts);
+                if report::available() {
+                    ui.add_space(6.0);
+                    widgets::toggle(ui, &mut s.send_reports, "Надсилати звіти про помилки розробнику", true);
+                    widgets::dim(
+                        ui,
+                        &p,
+                        "Лише коли щось не вдалося: посилання, текст помилки і версії програм. \
+                         Паролів і особистих файлів у звіті немає.",
+                    );
+                }
                 if install::is_installed_copy() {
                     ui.add_space(10.0);
                     if widgets::button(ui, icon::TRASH, "Видалити програму…")
@@ -568,7 +614,8 @@ impl KamertonApp {
                     *self.components.lock().unwrap() = State::Working("Перевірка компонентів…".into(), None);
                     components::spawn_update(self.tools.clone(), self.components.clone(), ui.ctx().clone());
                 }
-                if widgets::button(ui, icon::COPY, "Скопіювати звіт").clicked() {
+                // Зі звітами цей випадок надсилається автоматично, інакше його можна скопіювати.
+                if !report::available() && widgets::button(ui, icon::COPY, "Скопіювати звіт").clicked() {
                     ui.ctx().copy_text(self.env_info());
                 }
             }
@@ -1077,33 +1124,60 @@ fn status_block(ui: &mut egui::Ui, p: &Palette, j: &Job) {
     }
 }
 
-/// Текст для того, хто допомагає віддалено: що, де і як саме не вдалося.
-fn failure_report(j: &Job, f: &job::Failure, env_info: &str) -> String {
-    let summary = if j.summary.is_empty() { "інформація про відео" } else { j.summary.as_str() };
-    format!(
-        "{env_info}\nПосилання: {}\nЩо качалось: {summary}\nПомилка: {}\n\n--- yt-dlp ---\n{}",
-        j.url, f.message, f.log
-    )
+/// Звіт про помилку картки: що, де і як саме не вдалося.
+fn job_report(j: &Job, f: &job::Failure, tools: &str, auto: bool) -> Report {
+    let summary = if j.summary.is_empty() { "отримання інформації про відео".to_string() } else { j.summary.clone() };
+    Report::new(tools.to_string(), j.url.clone(), summary, f.message.clone(), f.log.clone(), auto)
 }
 
-fn card_buttons(ui: &mut egui::Ui, j: &mut Job, components_ready: bool, env_info: &str) {
+/// Надсилає звіт і показує на картці, як це пройшло.
+fn send_job_report(report: Report, state: &Arc<Mutex<ReportState>>, ctx: &egui::Context) {
+    *state.lock().unwrap() = ReportState::Sending;
+    let (state, ctx) = (state.clone(), ctx.clone());
+    report::send(report, move |ok| {
+        *state.lock().unwrap() = if ok { ReportState::Sent } else { ReportState::Failed };
+        ctx.request_repaint();
+    });
+}
+
+fn report_controls(ui: &mut egui::Ui, j: &mut Job, f: &job::Failure, tools: &str) {
+    let p = theme::palette(ui.ctx());
+    if !report::available() {
+        // Збірка без адреси для звітів: можна лише скопіювати текст.
+        if widgets::button(ui, icon::COPY, "Скопіювати звіт").clicked() {
+            ui.ctx().copy_text(job_report(j, f, tools, false).as_text());
+        }
+        return;
+    }
+    let state = *j.report.lock().unwrap();
+    match state {
+        ReportState::NotSent | ReportState::Failed => {
+            if widgets::button(ui, icon::SEND, "Надіслати звіт розробнику")
+                .on_hover_text("Опис помилки піде розробнику, щоб він міг розібратися")
+                .clicked()
+            {
+                send_job_report(job_report(j, f, tools, false), &j.report, ui.ctx());
+            }
+            if state == ReportState::Failed {
+                widgets::dim(ui, &p, "Не вдалося надіслати, перевірте інтернет");
+            }
+        }
+        ReportState::Sending => {
+            ui.spinner();
+            widgets::dim(ui, &p, "Надсилання звіту…");
+        }
+        ReportState::Sent => {
+            ui.label(RichText::new(format!("{}  Звіт надіслано розробнику", icon::CHECK)).size(15.0));
+        }
+    }
+}
+
+fn card_buttons(ui: &mut egui::Ui, j: &mut Job, components_ready: bool, tools: &str) {
     // Переносимо кнопки на новий рядок, якщо вікно вузьке, замість того щоб вилазити за картку.
     ui.horizontal_wrapped(|ui| {
         if let Status::Failed(f) | Status::InfoFailed(f) = &j.status {
-            let report = failure_report(j, f, env_info);
-            if widgets::button(ui, icon::COPY, "Скопіювати звіт")
-                .on_hover_text("Скопіювати опис помилки, щоб надіслати тому, хто допомагає")
-                .clicked()
-            {
-                ui.ctx().copy_text(report);
-                j.copied_at = Some(ui.input(|i| i.time));
-            }
-            if let Some(t) = j.copied_at
-                && ui.input(|i| i.time) - t < 4.0
-            {
-                widgets::dim(ui, &theme::palette(ui.ctx()), "Скопійовано, вставте в повідомлення");
-                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
-            }
+            let f = f.clone();
+            report_controls(ui, j, &f, tools);
         }
         match &j.status {
             Status::Ready => {
@@ -1190,6 +1264,7 @@ impl eframe::App for KamertonApp {
         }
 
         self.schedule(ctx);
+        self.auto_reports(ctx);
         if self.settings != self.saved_settings {
             self.settings.save(&self.dirs.config.join("settings.json"));
             self.saved_settings = self.settings.clone();
