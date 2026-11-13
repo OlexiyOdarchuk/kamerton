@@ -231,6 +231,17 @@ fn explain(stderr: &str) -> Failure {
         log: log.clone(),
         kind: FailureKind::NeedsLogin,
     };
+    // Перевіряємо першим: у тексті помилки є сама назва, а в ній можуть бути слова на кшталт «login».
+    if has("file name too long") || has("filename or extension is too long") || has("errno 36")
+        || has("winerror 206") || has("path too long")
+    {
+        return Failure {
+            message: "Назва файлу задовга. Скоротіть її в полі «Назва файлу».".into(),
+            details: first_error,
+            log,
+            kind: FailureKind::Other,
+        };
+    }
     // Chrome/Edge на Windows шифрують вхід (yt-dlp issue 10927): «Failed to decrypt with DPAPI».
     if has("dpapi")
         || has("app-bound")
@@ -405,7 +416,7 @@ pub fn spawn_fetch_info(job: JobRef, tools: Tools, settings: Settings, ctx: egui
             match result {
                 Ok(info) => {
                     if j.file_name.is_empty() && !info.is_playlist {
-                        j.file_name = info.title.clone();
+                        j.file_name = util::clean_title(&info.title);
                     }
                     j.info = Some(info);
                     j.status = Status::Ready;
@@ -556,7 +567,7 @@ pub fn spawn_download(
         let mut j = job.lock().unwrap();
         let is_playlist = j.info.as_ref().is_some_and(|i| i.is_playlist);
         let template = if is_playlist {
-            "%(playlist_title|Плейлист)s/%(playlist_index)03d - %(title)s.%(ext)s".to_string()
+            "%(playlist_title|Плейлист).100B/%(playlist_index)03d - %(title).150B.%(ext)s".to_string()
         } else {
             let name = util::sanitize_filename(&j.file_name);
             let name = if name.is_empty() { "%(title)s".to_string() } else { name };
@@ -838,6 +849,9 @@ mod tests {
 
         let f = explain("ERROR: Failed to decrypt with DPAPI. See https://github.com/yt-dlp/yt-dlp/issues/10927 for more info");
         assert_eq!(f.kind, FailureKind::CookiesUnreadable);
+
+        let f = explain("ERROR: unable to open for writing: [Errno 36] File name too long: 'Sign in to win.m4a.part'");
+        assert!(f.message.starts_with("Назва файлу задовга"), "{}", f.message);
 
         let f = explain("ERROR: Unsupported URL: https://example.com/");
         assert_eq!(f.kind, FailureKind::Other);

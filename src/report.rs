@@ -6,6 +6,7 @@
 //! недоступні і програма пропонує скопіювати звіт.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -102,6 +103,40 @@ pub fn may_auto_send(key: &str) -> bool {
 
 /// Надсилає звіт у фоні; `done` отримує результат.
 pub fn send(report: Report, done: impl FnOnce(bool) + Send + 'static) {
+    post(report, done);
+}
+
+/// Повідомлення про перший запуск: лише версія і система, без жодного ідентифікатора.
+#[derive(Serialize)]
+struct FirstLaunch {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    version: &'static str,
+    os: String,
+    /// Програмою вже користувались до цієї версії (є старі налаштування).
+    existing: bool,
+}
+
+/// Один раз повідомляє про перший запуск. Позначка `marker` з'являється лише після
+/// успішного надсилання, тож без інтернету спроба повториться наступного разу.
+pub fn first_launch(marker: PathBuf, existing: bool) {
+    if marker.exists() {
+        return;
+    }
+    let msg = FirstLaunch {
+        kind: "kamerton-install",
+        version: env!("CARGO_PKG_VERSION"),
+        os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        existing,
+    };
+    post(msg, move |ok| {
+        if ok {
+            let _ = std::fs::write(&marker, env!("CARGO_PKG_VERSION"));
+        }
+    });
+}
+
+fn post<T: Serialize + Send + 'static>(body: T, done: impl FnOnce(bool) + Send + 'static) {
     let Some(endpoint) = ENDPOINT.filter(|_| available()) else {
         done(false);
         return;
@@ -111,7 +146,7 @@ pub fn send(report: Report, done: impl FnOnce(bool) + Send + 'static) {
             .timeout_global(Some(Duration::from_secs(20)))
             .build()
             .into();
-        let ok = serde_json::to_string(&report).is_ok_and(|body| {
+        let ok = serde_json::to_string(&body).is_ok_and(|body| {
             agent.post(endpoint).header("Content-Type", "application/json").send(body.as_str()).is_ok()
         });
         done(ok);
@@ -169,5 +204,20 @@ mod live {
         let (tx, rx) = std::sync::mpsc::channel();
         super::send(r, move |ok| tx.send(ok).unwrap());
         assert!(rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap(), "воркер не прийняв звіт");
+    }
+
+    /// `KAMERTON_REPORT_URL=https://… cargo test first_launch_live -- --ignored`
+    #[test]
+    #[ignore]
+    fn first_launch_live() {
+        assert!(super::available(), "збірка без KAMERTON_REPORT_URL");
+        let marker = std::env::temp_dir().join(format!("kamerton-first-launch-{}", std::process::id()));
+        super::first_launch(marker.clone(), false);
+        let start = std::time::Instant::now();
+        while !marker.exists() && start.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(marker.exists(), "воркер не прийняв повідомлення");
+        let _ = std::fs::remove_file(marker);
     }
 }

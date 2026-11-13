@@ -207,7 +207,13 @@ pub fn fmt_bytes(b: f64) -> String {
     }
 }
 
-/// Прибирає з назви файлу символи, заборонені у Windows, і екранує `%` для шаблону yt-dlp.
+/// Найдовша назва файлу без розширення. Linux не приймає понад 255 байтів,
+/// Windows понад 260 символів у всьому шляху, а yt-dlp ще додає `.f123.m4a.part`.
+const MAX_NAME_CHARS: usize = 100;
+const MAX_NAME_BYTES: usize = 180;
+
+/// Прибирає з назви файлу символи, заборонені у Windows, обрізає задовгу назву
+/// і екранує `%` для шаблону yt-dlp.
 pub fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -217,7 +223,37 @@ pub fn sanitize_filename(name: &str) -> String {
             c => c,
         })
         .collect();
-    cleaned.trim().trim_end_matches('.').replace('%', "%%")
+    let cleaned = shorten(cleaned.trim());
+    cleaned.trim().trim_end_matches(['.', ' ']).replace('%', "%%")
+}
+
+/// Обрізає за межами довжини, по можливості на пробілі, щоб не рвати слово.
+fn shorten(s: &str) -> &str {
+    let mut end = 0;
+    for (n, (i, c)) in s.char_indices().enumerate() {
+        if n >= MAX_NAME_CHARS || i + c.len_utf8() > MAX_NAME_BYTES {
+            let cut = &s[..end];
+            let cut = match cut.rfind(' ') {
+                Some(sp) if sp > end / 2 => &cut[..sp],
+                _ => cut,
+            };
+            return cut.trim_end_matches([' ', ',', ';', '—', '–', '-']);
+        }
+        end = i + c.len_utf8();
+    }
+    s
+}
+
+/// Прибирає з назви службовий початок на кшталт «89K views · 4.4K reactions | » (Facebook).
+pub fn clean_title(title: &str) -> String {
+    if let Some((head, rest)) = title.split_once(" | ") {
+        let h = head.to_lowercase();
+        let stats = ["views", "reactions", "переглядів", "перегляди", "реакцій", "просмотров"];
+        if !rest.trim().is_empty() && stats.iter().any(|w| h.contains(w)) {
+            return rest.trim().to_string();
+        }
+    }
+    title.to_string()
 }
 
 #[cfg(test)]
@@ -242,5 +278,18 @@ mod tests {
     #[test]
     fn filenames() {
         assert_eq!(sanitize_filename("AC/DC: Live 100%"), "AC_DC_ Live 100%%");
+        let long = "Пісня «Дякуємо вам, наші захисники» Щира дитяча подяка нашим захисникам за Україну мирне небо та можливість мріяти";
+        let short = sanitize_filename(long);
+        assert!(short.len() <= MAX_NAME_BYTES && short.chars().count() <= MAX_NAME_CHARS);
+        assert!(long.starts_with(&short) && !short.ends_with(' '));
+        assert!(sanitize_filename(&"🇺🇦".repeat(200)).len() <= MAX_NAME_BYTES);
+        let cut = sanitize_filename(&format!("{}край, довжелезнеслово", "слово ".repeat(14)));
+        assert!(cut.ends_with("край"), "{cut}");
+    }
+
+    #[test]
+    fn titles() {
+        assert_eq!(clean_title("89K views · 4.4K reactions | Пісня | Anna"), "Пісня | Anna");
+        assert_eq!(clean_title("Rock | Live"), "Rock | Live");
     }
 }

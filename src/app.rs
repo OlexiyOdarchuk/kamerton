@@ -77,7 +77,11 @@ impl KamertonApp {
         // Залишки недокачаного з попереднього запуску (інша копія не працює, це гарантує блокування).
         let _ = std::fs::remove_dir_all(dirs.tmp());
         let tools = Tools::new(dirs.bin());
+        let existing = dirs.config.join("settings.json").exists();
         let settings = Settings::load(&dirs.config.join("settings.json"));
+        if settings.send_reports {
+            report::first_launch(dirs.config.join("first-launch-sent"), existing);
+        }
         let history = settings::load_history(&dirs.config.join("history.json"));
         let components = Arc::new(Mutex::new(State::Working("Перевірка компонентів…".into(), None)));
         components::spawn_update(tools.clone(), components.clone(), ctx.clone());
@@ -542,6 +546,7 @@ impl KamertonApp {
                         ui,
                         &p,
                         "Лише коли щось не вдалося: посилання, текст помилки і версії програм. \
+                         Ще одне повідомлення при першому запуску: тільки версія програми і система. \
                          Паролів і особистих файлів у звіті немає.",
                     );
                 }
