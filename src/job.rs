@@ -108,6 +108,10 @@ pub struct Job {
     pub report: Arc<Mutex<crate::report::ReportState>>,
     /// Яку помилку вже розглянули для автоматичного звіту (щоб не слати двічі).
     pub report_key: Option<String>,
+    /// Потік, знайдений на сторінці через браузер (коли yt-dlp сайту не знає).
+    pub stream: Option<crate::sniff::Found>,
+    /// Зараз іде пошук відео на сторінці (для підпису на картці).
+    pub searching_page: bool,
 }
 
 pub type JobRef = Arc<Mutex<Job>>;
@@ -132,6 +136,8 @@ impl Job {
             pid: None,
             report: Arc::new(Mutex::new(crate::report::ReportState::NotSent)),
             report_key: None,
+            stream: None,
+            searching_page: false,
         }))
     }
 
@@ -167,6 +173,23 @@ impl Job {
             self.status = Status::Cancelled;
         }
     }
+}
+
+/// Заголовки, з якими плеєр сторінки запитував знайдений потік: без них CDN часто відмовляє.
+fn stream_args(found: &crate::sniff::Found) -> Vec<OsString> {
+    let mut headers = Vec::new();
+    if let Some(r) = &found.referer {
+        headers.push(format!("Referer:{r}"));
+        // Origin: лише схема і хост сторінки, без шляху.
+        if let Some(i) = r.find("://") {
+            let end = r[i + 3..].find('/').map(|e| i + 3 + e).unwrap_or(r.len());
+            headers.push(format!("Origin:{}", &r[..end]));
+        }
+    }
+    if let Some(ua) = &found.user_agent {
+        headers.push(format!("User-Agent:{ua}"));
+    }
+    headers.into_iter().flat_map(|h| [OsString::from("--add-headers"), OsString::from(h)]).collect()
 }
 
 /// Аргументи, спільні для отримання інформації і завантаження.
@@ -270,7 +293,9 @@ fn explain(stderr: &str) -> Failure {
     {
         return login("Сайт показує це лише після входу в акаунт.");
     }
-    let message = if has("unsupported url") {
+    let message = if has("drm") {
+        "Відео захищене від копіювання (DRM), скачати його неможливо."
+    } else if has("unsupported url") {
         "Цей сайт або тип посилання не підтримується."
     } else if has("requested format is not available") {
         "Потрібної якості немає. Виберіть іншу якість."
@@ -391,22 +416,67 @@ fn crop_16_9(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Отримує назву, тривалість, доступні якості та обкладинку.
 pub fn spawn_fetch_info(job: JobRef, tools: Tools, settings: Settings, ctx: egui::Context) {
-    let url = {
+    let (url, stream) = {
         let mut j = job.lock().unwrap();
         j.status = Status::FetchingInfo;
-        j.url.clone()
+        (j.url.clone(), j.stream.clone())
     };
     std::thread::spawn(move || {
-        let mut args = base_args(&tools, &settings);
-        args.extend(["-J".into(), "--flat-playlist".into(), "--".into(), url.into()]);
-        let output = ytdlp_command(&tools, &args).output();
-        let result = match output {
-            Ok(out) if out.status.success() => serde_json::from_slice::<Value>(&out.stdout)
-                .map(|v| parse_info(&v))
-                .map_err(|e| Failure::other("Не вдалося розібрати відповідь yt-dlp.", e.to_string())),
-            Ok(out) => Err(explain(&String::from_utf8_lossy(&out.stderr))),
-            Err(e) => Err(Failure::other("Не вдалося запустити yt-dlp.", e.to_string())),
+        let fetch = |target: &str, stream: Option<&crate::sniff::Found>| -> Result<MediaInfo, Failure> {
+            let mut args = base_args(&tools, &settings);
+            if let Some(s) = stream {
+                args.extend(stream_args(s));
+            }
+            args.extend(["-J".into(), "--flat-playlist".into(), "--".into(), target.into()]);
+            match ytdlp_command(&tools, &args).output() {
+                Ok(out) if out.status.success() => serde_json::from_slice::<Value>(&out.stdout)
+                    .map(|v| parse_info(&v))
+                    .map_err(|e| Failure::other("Не вдалося розібрати відповідь yt-dlp.", e.to_string())),
+                Ok(out) => Err(explain(&String::from_utf8_lossy(&out.stderr))),
+                Err(e) => Err(Failure::other("Не вдалося запустити yt-dlp.", e.to_string())),
+            }
         };
+        let mut result = match &stream {
+            Some(s) => fetch(&s.url, Some(s)),
+            None => fetch(&url, None),
+        };
+
+        // yt-dlp сайту не знає: можливо, плеєр підвантажує відео скриптом. Шукаємо його через браузер.
+        let unsupported = matches!(&result, Err(f) if f.details.to_lowercase().contains("unsupported url"));
+        if stream.is_none() && unsupported {
+            job.lock().unwrap().searching_page = true;
+            ctx.request_repaint();
+            let original = result.as_ref().err().map(|f| f.details.clone()).unwrap_or_default();
+            result = match crate::sniff::sniff(&url, std::time::Duration::from_secs(30)) {
+                Ok(found) => {
+                    let r = fetch(&found.url, Some(&found)).map(|mut info| {
+                        // У самого .m3u8 назва на кшталт «index», тож беремо назву сторінки.
+                        if let Some(t) = &found.title {
+                            info.title = t.clone();
+                        }
+                        if info.thumbnail_url.is_none() {
+                            info.thumbnail_url = found.thumbnail.clone();
+                        }
+                        info
+                    });
+                    if r.is_ok() {
+                        job.lock().unwrap().stream = Some(found);
+                    }
+                    r
+                }
+                Err(crate::sniff::SniffError::NoBrowser) => Err(Failure::other(
+                    "Щоб знайти відео на цій сторінці, потрібен браузер Chrome, Edge або Brave.",
+                    original,
+                )),
+                Err(crate::sniff::SniffError::Nothing) => {
+                    Err(Failure::other("На сторінці не знайшлося відео, яке можна скачати.", original))
+                }
+                Err(crate::sniff::SniffError::Failed(e)) => {
+                    Err(Failure::other("Не вдалося перевірити сторінку в браузері.", e))
+                }
+            };
+            job.lock().unwrap().searching_page = false;
+        }
         let thumb_url = match &result {
             Ok(info) => info.thumbnail_url.clone(),
             Err(_) => None,
@@ -563,7 +633,7 @@ pub fn spawn_download(
     ctx: egui::Context,
     done_tx: Sender<HistoryEntry>,
 ) {
-    let (url, id, template, trim, cancel) = {
+    let (url, id, template, trim, cancel, stream) = {
         let mut j = job.lock().unwrap();
         let is_playlist = j.info.as_ref().is_some_and(|i| i.is_playlist);
         let template = if is_playlist {
@@ -583,7 +653,9 @@ pub fn spawn_download(
         if trim.is_some() {
             j.summary.push_str(" · фрагмент");
         }
-        (j.url.clone(), j.id, template, trim, j.cancel.clone())
+        // Для знайденого на сторінці потоку качаємо сам потік з тими ж заголовками.
+        let url = j.stream.as_ref().map(|s| s.url.clone()).unwrap_or_else(|| j.url.clone());
+        (url, j.id, template, trim, j.cancel.clone(), j.stream.clone())
     };
 
     std::thread::spawn(move || {
@@ -621,6 +693,9 @@ pub fn spawn_download(
             template.into(),
         ]);
         args.extend(format_args(&settings, trim).into_iter().map(OsString::from));
+        if let Some(s) = &stream {
+            args.extend(stream_args(s));
+        }
         args.extend(["--".into(), url.clone().into()]);
 
         let finish = |status: Status| {
@@ -826,6 +901,50 @@ mod tests {
             assert!(j.files.iter().all(|f| f.is_file()));
             assert!(rx.try_recv().is_ok());
         }
+    }
+
+    /// Сторінка, де плеєр вантажить .m3u8 скриптом: yt-dlp її не знає, потік шукається через браузер.
+    /// Запуск після `end_to_end` (той ставить інструменти): `cargo test page_stream -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn page_stream_end_to_end() {
+        let root = std::env::current_dir().unwrap().join("target/e2e");
+        let tools = Tools::new(root.join("bin"));
+        assert!(tools.ytdlp.is_file(), "спершу запустіть end_to_end");
+        let ctx = egui::Context::default();
+        let settings = Settings {
+            mode: Mode::Audio,
+            audio_format: AudioFormat::Mp3,
+            folder: root.join("out/page"),
+            ..Settings::default()
+        };
+        let _ = std::fs::remove_dir_all(&settings.folder);
+
+        // id 2: інакше паралельно з end_to_end обидва ділили б одну тимчасову теку.
+        let job = Job::new(2, "https://hlsjs.video-dev.org/demo/".into());
+        spawn_fetch_info(job.clone(), tools.clone(), settings.clone(), ctx.clone());
+        wait(&job, |s| !matches!(s, Status::FetchingInfo));
+        {
+            let mut j = job.lock().unwrap();
+            if let Status::InfoFailed(f) = &j.status {
+                panic!("{} / {}", f.message, f.details);
+            }
+            let s = j.stream.clone().expect("потік не знайдено");
+            println!("потік: {} (Referer {:?})", s.url, s.referer);
+            println!("назва: {}, тривалість {:?}", j.title(), j.info.as_ref().unwrap().duration);
+            j.trim_open = true;
+            j.trim_from = "0".into();
+            j.trim_to = "10".into();
+        }
+        let (tx, _rx) = std::sync::mpsc::channel();
+        spawn_download(job.clone(), tools, settings, root.join("tmp"), ctx, tx);
+        wait(&job, |s| matches!(s, Status::Done | Status::Failed(_) | Status::Cancelled));
+        let j = job.lock().unwrap();
+        if let Status::Failed(f) = &j.status {
+            panic!("{} / {}", f.message, f.details);
+        }
+        println!("файли: {:?}", j.files);
+        assert!(j.files.len() == 1 && j.files[0].is_file());
     }
 
     fn wait(job: &JobRef, done: impl Fn(&Status) -> bool) {

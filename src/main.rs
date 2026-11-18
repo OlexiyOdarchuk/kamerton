@@ -8,6 +8,7 @@ mod instance;
 mod job;
 mod report;
 mod settings;
+mod sniff;
 mod theme;
 mod updater;
 mod util;

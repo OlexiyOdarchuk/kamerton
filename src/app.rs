@@ -176,7 +176,10 @@ impl KamertonApp {
             let expected = f.kind != FailureKind::Other
                 || f.message.contains("недоступне")
                 || f.message.contains("не підтримується")
-                || f.message.contains("Потрібної якості");
+                || f.message.contains("Потрібної якості")
+                || f.message.contains("не знайшлося відео")
+                || f.message.contains("потрібен браузер")
+                || f.message.contains("DRM");
             if !expected && report::may_auto_send(&key) {
                 send_job_report(job_report(&j, &f, &tools, true), &j.report, ctx);
             }
@@ -1068,7 +1071,12 @@ fn status_block(ui: &mut egui::Ui, p: &Palette, j: &Job) {
         Status::FetchingInfo => {
             ui.horizontal(|ui| {
                 ui.spinner();
-                widgets::dim(ui, p, "Отримання інформації про відео…");
+                let text = if j.searching_page {
+                    "Шукаю відео на сторінці, це до півхвилини…"
+                } else {
+                    "Отримання інформації про відео…"
+                };
+                widgets::dim(ui, p, text);
             });
         }
         Status::Ready => {}
@@ -1202,7 +1210,13 @@ fn card_buttons(ui: &mut egui::Ui, j: &mut Job, components_ready: bool, tools: &
             }
             Status::Failed(_) | Status::Cancelled => {
                 if ui.add_enabled(j.trim_range().is_ok(), egui::Button::new(format!("{}  Повторити", icon::RETRY))).clicked() {
-                    j.status = Status::Queued;
+                    if j.stream.is_some() {
+                        // Посилання на потік зі сторінки могло протухнути: шукаємо його заново.
+                        j.stream = None;
+                        j.status = Status::NeedInfo;
+                    } else {
+                        j.status = Status::Queued;
+                    }
                 }
             }
             Status::Done => {
