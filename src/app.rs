@@ -894,7 +894,11 @@ fn job_card(
                 card_edit(ui, p, j);
                 status_block(ui, p, j);
                 let failure = match &j.status {
-                    Status::Failed(f) | Status::InfoFailed(f) if f.kind != FailureKind::Other => Some(f.kind),
+                    Status::Failed(f) | Status::InfoFailed(f)
+                        if matches!(f.kind, FailureKind::NeedsLogin | FailureKind::CookiesUnreadable) =>
+                    {
+                        Some(f.kind)
+                    }
                     _ => None,
                 };
                 if let Some(kind) = failure {
@@ -1203,6 +1207,8 @@ fn card_buttons(ui: &mut egui::Ui, j: &mut Job, components_ready: bool, tools: &
                     j.stop();
                 }
             }
+            // Сайт не пускає програми: повтор не допоможе, кнопку не пропонуємо.
+            Status::InfoFailed(f) | Status::Failed(f) if f.kind == FailureKind::Blocked => {}
             Status::InfoFailed(_) => {
                 if ui.add_enabled(components_ready, egui::Button::new(format!("{}  Спробувати ще раз", icon::RETRY))).clicked() {
                     j.status = Status::NeedInfo;

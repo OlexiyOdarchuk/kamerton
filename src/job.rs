@@ -68,6 +68,8 @@ pub enum FailureKind {
     NeedsLogin,
     /// Вхід з вибраного браузера прочитати не вдалося: картка пропонує інший браузер.
     CookiesUnreadable,
+    /// Сайт навмисно не пускає програми (захист від ботів). Повтор не допоможе.
+    Blocked,
 }
 
 impl Failure {
@@ -254,6 +256,16 @@ fn explain(stderr: &str) -> Failure {
         log: log.clone(),
         kind: FailureKind::NeedsLogin,
     };
+    if is_bot_protection(&e) {
+        return Failure {
+            message: "Сайт захищений від програм для завантаження (Cloudflare) і не пускає Камертон. \
+                      Повторна спроба тут не допоможе."
+                .into(),
+            details: first_error,
+            log,
+            kind: FailureKind::Blocked,
+        };
+    }
     // Перевіряємо першим: у тексті помилки є сама назва, а в ній можуть бути слова на кшталт «login».
     if has("file name too long") || has("filename or extension is too long") || has("errno 36")
         || has("winerror 206") || has("path too long")
@@ -600,9 +612,18 @@ fn ffmpeg_post(tools: &Tools, path: &Path, s: &Settings) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
+/// Сайт навмисно відсіює програми: перевірка Cloudflare на бота, капча.
+/// `e` має бути вже в нижньому регістрі.
+fn is_bot_protection(e: &str) -> bool {
+    e.contains("anti-bot") || e.contains("cloudflare") || e.contains("captcha") || e.contains("attention required")
+}
+
 /// Помилка, яка зазвичай зникає при повторній спробі (а не «потрібен вхід» чи «відео немає»).
 fn is_transient(stderr: &str) -> bool {
     let e = stderr.to_lowercase();
+    if is_bot_protection(&e) {
+        return false;
+    }
     ["http error 403", "http error 5", "timed out", "connection reset", "remote end closed", "incompleteread"]
         .iter()
         .any(|s| e.contains(s))
@@ -971,6 +992,14 @@ mod tests {
 
         let f = explain("ERROR: unable to open for writing: [Errno 36] File name too long: 'Sign in to win.m4a.part'");
         assert!(f.message.starts_with("Назва файлу задовга"), "{}", f.message);
+
+        let f = explain(
+            "ERROR: [generic] Got HTTP Error 403 caused by Cloudflare anti-bot challenge; \
+             try again with  --extractor-args \"generic:impersonate\"",
+        );
+        assert_eq!(f.kind, FailureKind::Blocked);
+        assert!(!is_transient("ERROR: HTTP Error 403 caused by Cloudflare anti-bot challenge"));
+        assert!(is_transient("ERROR: unable to download video data: HTTP Error 403: Forbidden"));
 
         let f = explain("ERROR: Unsupported URL: https://example.com/");
         assert_eq!(f.kind, FailureKind::Other);
